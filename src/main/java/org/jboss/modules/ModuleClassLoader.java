@@ -24,6 +24,11 @@ import java.security.ProtectionDomain;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
+
+import com.ibm.oti.shared.HelperAlreadyDefinedException;
+import com.ibm.oti.shared.Shared;
+import com.ibm.oti.shared.SharedClassHelperFactory;
+import com.ibm.oti.shared.SharedClassTokenHelper;
 import org.jboss.modules.filter.PathFilter;
 import org.jboss.modules.filter.PathFilters;
 import org.jboss.modules.log.ModuleLogger;
@@ -68,6 +73,7 @@ public class ModuleClassLoader extends ConcurrentClassLoader {
 
     private final Module module;
     private final ClassFileTransformer transformer;
+    private SharedClassTokenHelper tokenHelper = null;
 
     private final AtomicReference<Paths<ResourceLoader, ResourceLoaderSpec>> paths = new AtomicReference<>(Paths.<ResourceLoader, ResourceLoaderSpec>none());
 
@@ -104,6 +110,7 @@ public class ModuleClassLoader extends ConcurrentClassLoader {
         }
     };
 
+
     /**
      * Construct a new instance.
      *
@@ -111,6 +118,15 @@ public class ModuleClassLoader extends ConcurrentClassLoader {
      */
     protected ModuleClassLoader(final Configuration configuration) {
         super(configuration.getModule().getModuleLoader().getModuleDescription(configuration.getModule()));
+        if (Shared.isSharingEnabled()) {
+            SharedClassHelperFactory factory = Shared.getSharedClassHelperFactory();
+            try {
+                tokenHelper = factory.getTokenHelper(this);
+            } catch (HelperAlreadyDefinedException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
         module = configuration.getModule();
         paths.lazySet(new Paths<>(configuration.getResourceLoaders(), Collections.<String, List<ResourceLoader>>emptyMap()));
         final AssertionSetting setting = configuration.getAssertionSetting();
@@ -185,11 +201,45 @@ public class ModuleClassLoader extends ConcurrentClassLoader {
         }
         final ModuleLogger log = Module.log;
         final Module module = this.module;
+
+        if (tokenHelper != null) {
+            byte[] sharedClass = tokenHelper.findSharedClass(module.getName(), className);
+            if (sharedClass != null) {
+              final String name = className; 
+              final int lastIdx = name.lastIndexOf('.');
+              if (lastIdx != -1) {
+                // there's a package name; get the Package for it
+                final String packageName = name.substring(0, lastIdx);
+                synchronized (this) {
+                  Package pkg = findLoadedPackage(packageName);
+                  if (pkg == null) {
+                     pkg = definePackage(packageName, null);
+                  }
+                }
+              }
+              try {
+                Class<?> aClass = defineClass(className, sharedClass, 0, sharedClass.length);
+                module.getModuleLoader().incClassCount();
+                return aClass;
+              } catch (LinkageError e) {
+                loadedClass = findLoadedClass(className);
+                if (loadedClass != null) {
+                    module.getModuleLoader().incRaceCount();
+                    return loadedClass;
+                }
+                throw e;
+              }
+            }
+        }
+
         log.trace("Finding class %s from %s", className, module);
 
         final Class<?> clazz = module.loadModuleClass(className, resolve);
 
         if (clazz != null) {
+            if (tokenHelper != null) {
+                tokenHelper.storeSharedClass(module.getName(), clazz);
+            }
             return clazz;
         }
 
